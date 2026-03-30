@@ -294,7 +294,7 @@ def run_simulation(geometry: str, configs: list[TransducerConfig], sim_idx: int,
           f"{Nx}×{Ny} grid | {len(configs)} transducers | {n_t} timesteps")
 
     sensor_data = kspaceFirstOrder2D(
-        kgrid, medium, source, sensor,
+        kgrid, source, sensor, medium,
         simulation_options=sim_options,
         execution_options=exec_options,
     )
