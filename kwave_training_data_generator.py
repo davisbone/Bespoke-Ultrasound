@@ -46,7 +46,6 @@ from kwave.options.simulation_execution_options import SimulationExecutionOption
 from kwave.utils.signals import tone_burst
 from kwave.utils.mapgen import make_disc
 
-
 # ──────────────────────────────────────────────────────────────────
 # PHYSICAL CONSTANTS & GEOMETRY DEFINITIONS
 # ──────────────────────────────────────────────────────────────────
