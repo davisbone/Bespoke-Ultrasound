@@ -5,7 +5,7 @@
 Synthetic Cell Trajectory Simulator
 =====================================
 Simulates underdamped Langevin trajectories of cells driven by the
-acoustic radiation force fields produced by k-Wave (stored in training_data/).
+acoustic radiation force fields produced by k-Wave (stored in trainingData/).
 
 Physics model (underdamped Langevin):
     dx/dt = v
@@ -24,11 +24,11 @@ Units used throughout:
     time       : seconds [s]
 
 Output (per simulation):
-    trajectory_data/<geometry>/traj_<sim_idx>_<cell_idx>.csv
-    trajectory_data/traj_metadata.json
+    trajectoryData/<geometry>/traj_<sim_idx>_<cell_idx>.csv
+    trajectoryData/traj_metadata.json
 
 Usage:
-    python simulate_trajectories.py
+    python simulateTrajectories.py
 """
 
 import os
@@ -89,7 +89,7 @@ PRERUN        = 200         # equilibration steps (not recorded)
 # Training data directory
 TRAINING_DATA_ROOT = 'trainingData'
 OUTPUT_ROOT        = 'trajectoryData'
-PML_SIZE           = 20     # must match kwave_training_data_generator.py
+PML_SIZE           = 20     # must match kwaveTrainingDataGenerator.py
 
 
 # ──────────────────────────────────────────────────────────────────────────────

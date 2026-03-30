@@ -1,5 +1,5 @@
 # cd /Users/davisbone/Repositories/Bespoke-Ultrasound
-# .venv/bin/python visualize_training_data.py
+# .venv/bin/python visualizeTrainingData.py
 
 """
 Visualization of k-Wave acoustic pressure field training data.
@@ -20,7 +20,7 @@ import h5py
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-METADATA_PATH = 'training_data/metadata.json'
+METADATA_PATH = 'trainingData/metadata.json'
 PML_SIZE = 20   # must match the value used during simulation
 
 
