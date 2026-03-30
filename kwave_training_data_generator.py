@@ -1,3 +1,6 @@
+# cd /Users/davisbone/Repositories/Bespoke-Ultrasound
+# .venv/bin/python kwave_training_data_generator.py
+
 """
 Acoustic Pressure Field Training Data Generator
 ================================================
@@ -41,7 +44,7 @@ from kwave.kspaceFirstOrder2D import kspaceFirstOrder2D
 from kwave.options.simulation_options import SimulationOptions
 from kwave.options.simulation_execution_options import SimulationExecutionOptions
 from kwave.utils.signals import tone_burst
-from kwave.utils.mapgen import make_disc, make_rect
+from kwave.utils.mapgen import make_disc
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -124,6 +127,10 @@ def make_grid(geometry: str):
     Nx = int(np.ceil(width_m / DX))
     Ny = int(np.ceil(depth_m / DX))
 
+    # Include PML in grid dimensions (pml_inside=True: PML is carved from the grid)
+    Nx += 2 * PML_SIZE
+    Ny += 2 * PML_SIZE
+
     # Ensure even grid dimensions (k-Wave requirement)
     Nx = Nx + (Nx % 2)
     Ny = Ny + (Ny % 2)
@@ -168,7 +175,7 @@ def place_transducers(kgrid, Nx: int, Ny: int, configs: list[TransducerConfig]):
     source.p_mask = source_mask.astype(int)
 
     # Build tone burst signals for each source point
-    t_end = 5.0 / FREQUENCY         # 5 cycles
+    t_end = 30.0 / FREQUENCY        # 30 cycles — enough for steady-state RMS
     dt = CFL * DX / MEDIUM_SOUND_SPEED
     t_array = np.arange(0, t_end, dt)
     n_t = len(t_array)
@@ -209,7 +216,7 @@ def make_sensor(Nx: int, Ny: int):
     sensor = kSensor()
     # Full-domain pressure map (for training data)
     sensor.mask = np.ones((Nx, Ny), dtype=int)
-    sensor.record = ['p', 'p_final']
+    sensor.record = ['p']
     return sensor
 
 
@@ -284,8 +291,7 @@ def run_simulation(geometry: str, configs: list[TransducerConfig], sim_idx: int,
 
     sim_options = SimulationOptions(
         pml_size=PML_SIZE,
-        pml_inside=False,
-        save_to_disk=False,
+        save_to_disk=True,
         data_cast='single',
     )
     exec_options = SimulationExecutionOptions(is_gpu_simulation=False)
@@ -298,13 +304,13 @@ def run_simulation(geometry: str, configs: list[TransducerConfig], sim_idx: int,
         simulation_options=sim_options,
         execution_options=exec_options,
     )
+    assert sensor_data is not None
 
-    # Extract final pressure field (Nx × Ny)
-    p_final = sensor_data['p_final']  # shape: (Nx, Ny)
-
-    # RMS pressure over time at each point (useful for radiation force ∝ <p²>)
-    p_time = sensor_data['p']  # shape: (Nx*Ny, n_t)
-    p_rms = np.sqrt(np.mean(p_time.reshape(Nx, Ny, -1) ** 2, axis=-1))
+    # RMS pressure and final snapshot from time series (Nx*Ny × n_t)
+    p_time = sensor_data['p']
+    p_3d   = p_time.reshape(Nx, Ny, -1, order='F')
+    p_rms  = np.sqrt(np.mean(p_3d ** 2, axis=-1))  # (Nx, Ny)
+    p_final = p_3d[:, :, -1]                        # (Nx, Ny) last timestep
 
     # Acoustic intensity I = p_rms² / (ρ c)  [W/m²]
     intensity = p_rms ** 2 / (MEDIUM_DENSITY * MEDIUM_SOUND_SPEED)
@@ -386,116 +392,6 @@ def generate_training_dataset(
 
 
 # ──────────────────────────────────────────────────────────────────
-# VISUALIZATION UTILITY (optional, for quick inspection)
-# ──────────────────────────────────────────────────────────────────
-
-def plot_pressure_field(h5_path: str, save_png: bool = True):
-    """Load a saved simulation and plot the RMS pressure and radiation force."""
-    import matplotlib.pyplot as plt
-    import matplotlib.ticker as ticker
-
-    with h5py.File(h5_path, 'r') as f:
-        p_rms   = f['p_rms'][:]
-        rf_dens = f['radiation_force_dens'][:]
-        Nx      = f.attrs['Nx']
-        Ny      = f.attrs['Ny']
-        dx      = f.attrs['dx_m']
-        geo     = f.attrs['geometry']
-        n_tx    = f.attrs['n_transducers']
-        x_norms = f['transducer_x_norm'][:]
-
-    x_mm = np.arange(Nx) * dx * 1e3
-    y_mm = np.arange(Ny) * dx * 1e3
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle(f"Geometry: {geo} | {n_tx} transducer(s)", fontsize=13, fontweight='bold')
-
-    # Transpose for (y=depth on vertical axis, x=horizontal)
-    im0 = axes[0].imshow(p_rms.T, origin='upper', aspect='auto',
-                          extent=[x_mm[0], x_mm[-1], y_mm[-1], y_mm[0]],
-                          cmap='inferno')
-    axes[0].set_title('RMS Pressure (Pa)')
-    axes[0].set_xlabel('x (mm)')
-    axes[0].set_ylabel('depth / y (mm)  [↓ = gravity direction]')
-    plt.colorbar(im0, ax=axes[0])
-
-    # Mark transducer positions
-    for xn in x_norms:
-        axes[0].axvline(x=xn * x_mm[-1], color='cyan', lw=1.2, ls='--', alpha=0.7)
-
-    im1 = axes[1].imshow(rf_dens.T, origin='upper', aspect='auto',
-                          extent=[x_mm[0], x_mm[-1], y_mm[-1], y_mm[0]],
-                          cmap='viridis')
-    axes[1].set_title('Radiation Force Density (N/m³)')
-    axes[1].set_xlabel('x (mm)')
-    axes[1].set_ylabel('depth / y (mm)')
-    plt.colorbar(im1, ax=axes[1])
-
-    plt.tight_layout()
-
-    if save_png:
-        png_path = h5_path.replace('.h5', '_preview.png')
-        plt.savefig(png_path, dpi=150)
-        print(f"  Saved preview: {png_path}")
-    plt.show()
-
-
-# ──────────────────────────────────────────────────────────────────
-# DATALOADER UTILITY (for PyTorch training)
-# ──────────────────────────────────────────────────────────────────
-
-class AcousticFieldDataset:
-    """
-    Minimal dataset class compatible with PyTorch DataLoader.
-    Loads HDF5 files lazily.
-
-    Usage:
-        from kwave_training_data_generator import AcousticFieldDataset
-        import torch
-        from torch.utils.data import DataLoader
-
-        ds = AcousticFieldDataset('training_data/metadata.json', field='p_rms')
-        loader = DataLoader(ds, batch_size=8, shuffle=True)
-        for fields, labels in loader:
-            ...
-    """
-
-    def __init__(self, metadata_json: str, field: str = 'p_rms',
-                 geometry_filter: str | None = None):
-        with open(metadata_json) as f:
-            self.meta = json.load(f)
-
-        if geometry_filter:
-            self.meta = [m for m in self.meta if m['geometry'] == geometry_filter]
-
-        self.field = field
-
-    def __len__(self):
-        return len(self.meta)
-
-    def __getitem__(self, idx):
-        m = self.meta[idx]
-        with h5py.File(m['file'], 'r') as f:
-            field_data = f[self.field][:]              # (Nx, Ny)
-            x_norms    = f['transducer_x_norm'][:]
-            phases     = f['transducer_phase_deg'][:]
-            amps       = f['transducer_amplitude'][:]
-
-        # Normalize field to [0, 1]
-        field_data = (field_data - field_data.min()) / (field_data.max() - field_data.min() + 1e-9)
-
-        # Label vector: concatenate transducer descriptors (pad to max length)
-        max_tx = 8
-        label = np.zeros(max_tx * 3, dtype=np.float32)
-        n = min(len(x_norms), max_tx)
-        label[:n]          = x_norms[:n]
-        label[max_tx:max_tx+n]   = phases[:n] / 360.0   # normalize phases
-        label[2*max_tx:2*max_tx+n] = amps[:n]
-
-        return field_data.astype(np.float32)[np.newaxis, ...], label  # (1, Nx, Ny), (24,)
-
-
-# ──────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────
 
@@ -511,8 +407,3 @@ if __name__ == '__main__':
         n_transducers_list=[1, 2, 4, 8],
         output_root='training_data',
     )
-
-    # Quick visualization of the first result
-    if metadata:
-        print("\nGenerating preview plot for first simulation...")
-        plot_pressure_field(metadata[0]['file'])
