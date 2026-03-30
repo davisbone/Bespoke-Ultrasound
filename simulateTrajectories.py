@@ -87,8 +87,8 @@ OVERSAMPLING  = 10          # integration substeps per DT  →  ddt = 1 ms
 PRERUN        = 200         # equilibration steps (not recorded)
 
 # Training data directory
-TRAINING_DATA_ROOT = 'training_data'
-OUTPUT_ROOT        = 'trajectory_data'
+TRAINING_DATA_ROOT = 'trainingData'
+OUTPUT_ROOT        = 'trajectoryData'
 PML_SIZE           = 20     # must match kwave_training_data_generator.py
 
 
