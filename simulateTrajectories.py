@@ -24,7 +24,7 @@ Units used throughout:
     time       : seconds [s]
 
 Output (per simulation):
-    trajectoryData/<geometry>/traj_<sim_idx>_<cell_idx>.csv
+    trajectoryData/<geometry>/traj_<sim_idx>.csv   (all cells, multi-particle CSV)
     trajectoryData/traj_metadata.json
 
 Usage:
@@ -42,6 +42,8 @@ from pathlib import Path
 sys.path.insert(0, 'StochasticForceInference')
 os.environ["JAX_PLATFORMS"] = "cpu"
 
+import jax
+jax.config.update("jax_enable_x64", True)   # float64 needed: step sizes ~3 nm, float32 resolution ~120 nm
 import jax.numpy as jnp
 from jax import random, jit
 from SFI.SFI_Langevin import UnderdampedLangevinProcess
@@ -58,19 +60,27 @@ TARGET_PRESSURE_PA  = 160e3        # Pa — target acoustic pressure at the cell
 KWAVE_SOURCE_PA     = 1.0          # Pa — source amplitude used in simulation
 PRESSURE_SCALE      = (TARGET_PRESSURE_PA / KWAVE_SOURCE_PA) ** 2   # ≈ 2.56e10
 
+# Synthetic force boost for ULI demonstration.
+# The k-Wave point-source simulation at 1 Pa produces radiation force ~4e-7 m/s² after
+# scaling to 160 kPa. This is far too small for visible cell motion in a 22 mm domain.
+# FORCE_BOOST amplifies the spatial pattern to a regime where ULI inference is tractable.
+# The boost does NOT change the force topology (beam pattern), only its magnitude.
+FORCE_BOOST = 1e4     # dimensionless; effective force ~4e-3 m/s² after boost
+
 # ── Cell biophysics ──────────────────────────────────────────────────────────
-# Effective damping in the underdamped Langevin model.
-# True Stokes drag for a 10 µm cell: γ = 6πηr/m ≈ 30,000 s⁻¹ (heavily overdamped).
-# We use a much lower effective γ (1 s⁻¹) for a synthetic underdamped regime,
-# matching the ULI algorithm's intent and giving visible inertia in the trajectories.
-# This mimics "persistent" active cell motility, which the ULI framework is designed for.
-GAMMA = 1.0           # effective damping  [s⁻¹]
+# Synthetic damping tuned so that:
+#   γ · DT = 50 × 0.01 = 0.5  →  intermediate regime optimal for ULI WeakNoise estimator
+#   (γ·DT << 1 is underdamped but biases the D estimator; γ·DT >> 1 is overdamped and
+#    the ULI force signal (velocity change) is dominated by noise rather than force)
+# True Stokes drag: γ = 6πηr/m ≈ 30,000 s⁻¹; here chosen for algorithmic convenience.
+GAMMA = 50.0          # effective damping  [s⁻¹]
 
 # Diffusion in velocity space (D), calibrated so that the acoustic drift competes
-# with the stochastic velocity fluctuations at SNR ≈ 3:
-#   v_thermal ~ sqrt(D/γ) ≈ 1.5e-7 m/s
-#   v_terminal = F_max/γ  ≈ 4e-7 m/s   (at 160 kPa, FORCE_SCALE below)
-DIFFUSION = 1e-13     # D [m²/s³]  — velocity-space diffusion (NOT positional)
+# with the stochastic velocity fluctuations at SNR ≈ 6:
+#   v_thermal ~ sqrt(D/γ) = sqrt(1e-8/50) ≈ 1.4e-5 m/s
+#   v_terminal = F_max/γ  = 4e-3/50       = 8e-5 m/s   →  SNR ≈ 6
+#   drift in 50 s         = 8e-5 × 50     = 4 mm (18 % of well width)
+DIFFUSION = 1e-8      # D [m²/s³]  — velocity-space diffusion (NOT positional)
 
 # Cell geometry (used only to convert radiation force density → acceleration)
 CELL_DENSITY_KG_M3 = 1050.0   # kg/m³  (slightly denser than water)
@@ -80,7 +90,9 @@ _cell_volume = (4.0 / 3.0) * np.pi * CELL_RADIUS_M ** 3   # m³  ≈ 4.2e-15
 FORCE_SCALE = 1.0 / CELL_DENSITY_KG_M3   # [m³/kg]
 
 # Trajectory parameters
-N_CELLS       = 5           # independent cells per acoustic field
+# N_CELLS is a target — actual count = nx × ny, chosen to match domain aspect ratio.
+# 50 cells on a regular grid gives ULI enough spatial coverage to fit the beam pattern.
+N_CELLS       = 50          # target cells per acoustic field
 N_STEPS       = 5_000       # recorded time steps
 DT            = 0.01        # s — recording interval (10 ms)
 OVERSAMPLING  = 10          # integration substeps per DT  →  ddt = 1 ms
@@ -93,7 +105,7 @@ PML_SIZE           = 20     # must match kwaveTrainingDataGenerator.py
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HELPER: load k-Wave radiation force field and build interpolator
+# HELPER: load k-Wave radiation force field
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_force_field(h5_path: str):
@@ -101,7 +113,7 @@ def load_force_field(h5_path: str):
     Load the radiation force density field from HDF5.
 
     Scales to TARGET_PRESSURE_PA and converts N/m³ → m/s² (acceleration).
-    Returns the raw grid arrays for JAX-native bilinear interpolation.
+    Returns raw grid arrays for JAX-native bilinear interpolation.
 
     Returns
     -------
@@ -110,23 +122,52 @@ def load_force_field(h5_path: str):
     y_m     : np.ndarray  depth coordinates      [m]
     """
     with h5py.File(h5_path, 'r') as f:
-        rf = f['radiation_force_dens'][:]   # shape (Nx, Ny), N/m³
+        rf = f['radiation_force_dens'][:]
         Nx  = int(f.attrs['Nx'])
         Ny  = int(f.attrs['Ny'])
         dx  = float(f.attrs['dx_m'])
 
-    # Trim PML padding
     rf_interior = rf[PML_SIZE:Nx - PML_SIZE, PML_SIZE:Ny - PML_SIZE]
-
-    # Physical coordinate arrays (origin = top-left of interior domain)
     iNx, iNy = rf_interior.shape
-    x_m = np.arange(iNx, dtype=np.float32) * dx
-    y_m = np.arange(iNy, dtype=np.float32) * dx
-
-    # Scale to target LIPUS pressure (RF ∝ p²) then convert N/m³ → m/s²
-    Fy_grid = (rf_interior * PRESSURE_SCALE * FORCE_SCALE).astype(np.float32)
-
+    x_m = np.arange(iNx, dtype=np.float64) * dx
+    y_m = np.arange(iNy, dtype=np.float64) * dx
+    Fy_grid = (rf_interior * PRESSURE_SCALE * FORCE_SCALE * FORCE_BOOST).astype(np.float64)
     return Fy_grid, x_m, y_m
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GRID PLACEMENT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def make_grid_positions(x_m: np.ndarray, y_m: np.ndarray,
+                        n_cells: int, margin: float = 0.08):
+    """
+    Return a regular grid of ~n_cells starting positions within the domain.
+
+    The grid aspect ratio matches the domain so cells are roughly uniformly
+    spaced regardless of geometry.
+
+    Returns
+    -------
+    positions : np.ndarray  shape (n_actual, 2)  in metres
+    """
+    x_span = float(x_m[-1] - x_m[0])
+    y_span = float(y_m[-1] - y_m[0])
+    aspect = x_span / y_span
+
+    ny = max(2, int(round(np.sqrt(n_cells / aspect))))
+    nx = max(2, int(round(n_cells / ny)))
+
+    x_lo = float(x_m[0])  + margin * x_span
+    x_hi = float(x_m[-1]) - margin * x_span
+    y_lo = float(y_m[0])  + margin * y_span
+    y_hi = float(y_m[-1]) - margin * y_span
+
+    xs = np.linspace(x_lo, x_hi, nx)
+    ys = np.linspace(y_lo, y_hi, ny)
+    XX, YY = np.meshgrid(xs, ys)
+    positions = np.stack([XX.ravel(), YY.ravel()], axis=-1).astype(np.float64)
+    return positions, nx, ny
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,10 +187,9 @@ def make_force_fn(Fy_grid: np.ndarray, x_m: np.ndarray, y_m: np.ndarray):
     Uses JAX-native bilinear interpolation so the function can be
     JIT-compiled and vectorised by the SFI simulation engine.
     """
-    # Convert grid to JAX arrays (captured in closure, not traced)
-    x_jax  = jnp.array(x_m, dtype=jnp.float32)
-    y_jax  = jnp.array(y_m, dtype=jnp.float32)
-    Fy_jax = jnp.array(Fy_grid, dtype=jnp.float32)  # shape (iNx, iNy)
+    x_jax  = jnp.array(x_m, dtype=jnp.float64)
+    y_jax  = jnp.array(y_m, dtype=jnp.float64)
+    Fy_jax = jnp.array(Fy_grid, dtype=jnp.float64)
 
     dx = x_jax[1] - x_jax[0]
     dy = y_jax[1] - y_jax[0]
@@ -159,31 +199,19 @@ def make_force_fn(Fy_grid: np.ndarray, x_m: np.ndarray, y_m: np.ndarray):
     Ny_g = y_jax.shape[0]
 
     def bilinear(x, y):
-        """Bilinear interpolation of Fy_jax at (x, y)."""
-        # Clamp
         xc = jnp.clip(x, x0, x_jax[-1])
         yc = jnp.clip(y, y0, y_jax[-1])
-        # Grid indices (integer)
-        ix = jnp.floor((xc - x0) / dx).astype(jnp.int32)
-        iy = jnp.floor((yc - y0) / dy).astype(jnp.int32)
-        ix = jnp.clip(ix, 0, Nx_g - 2)
-        iy = jnp.clip(iy, 0, Ny_g - 2)
-        # Fractional offsets
+        ix = jnp.clip(jnp.floor((xc - x0) / dx).astype(jnp.int32), 0, Nx_g - 2)
+        iy = jnp.clip(jnp.floor((yc - y0) / dy).astype(jnp.int32), 0, Ny_g - 2)
         tx = (xc - (x0 + ix * dx)) / dx
         ty = (yc - (y0 + iy * dy)) / dy
-        # Four corners
-        f00 = Fy_jax[ix,     iy    ]
-        f10 = Fy_jax[ix + 1, iy    ]
-        f01 = Fy_jax[ix,     iy + 1]
-        f11 = Fy_jax[ix + 1, iy + 1]
-        return ((1 - tx) * (1 - ty) * f00
-              + tx       * (1 - ty) * f10
-              + (1 - tx) * ty       * f01
-              + tx       * ty       * f11)
+        return ((1 - tx) * (1 - ty) * Fy_jax[ix,     iy    ]
+              + tx       * (1 - ty) * Fy_jax[ix + 1, iy    ]
+              + (1 - tx) * ty       * Fy_jax[ix,     iy + 1]
+              + tx       * ty       * Fy_jax[ix + 1, iy + 1])
 
     def force(X, V, theta):
         gamma = theta[0]
-        # Acoustic body force acts downward (y-direction only)
         F_acoustic = jnp.array([0.0, bilinear(X[0], X[1])])
         return F_acoustic - gamma * V
 
@@ -196,41 +224,37 @@ def make_force_fn(Fy_grid: np.ndarray, x_m: np.ndarray, y_m: np.ndarray):
 
 def simulate_for_field(h5_path: str, sim_idx: int, output_dir: str, key):
     """
-    Simulate N_CELLS cell trajectories driven by the acoustic field in h5_path.
-    Saves one CSV per cell, returns list of output paths.
+    Simulate all cells for one acoustic field in a SINGLE multi-particle call.
+
+    All cells share the same compiled force function — compilation happens once
+    per acoustic field, not once per cell.
+
+    Saves one multi-particle CSV (all cells, particle_id column distinguishes them).
+    Returns the output path and updated PRNG key.
     """
     Fy_grid, x_m, y_m = load_force_field(h5_path)
-    x_min, x_max = float(x_m[0]), float(x_m[-1])
-    y_min, y_max = float(y_m[0]), float(y_m[-1])
     force_fn = make_force_fn(Fy_grid, x_m, y_m)
 
-    theta_F = jnp.array([GAMMA])   # params passed to force_fn
+    # Place cells on a regular grid
+    positions, nx, ny = make_grid_positions(x_m, y_m, N_CELLS)
+    n_actual = len(positions)
+
+    init_pos = jnp.array(positions)          # (n_actual, 2)
+    init_vel = jnp.zeros((n_actual, 2))
+    theta_F  = jnp.array([GAMMA])
     D_matrix = DIFFUSION * jnp.eye(2)
 
-    output_paths = []
-    for cell_idx in range(N_CELLS):
-        key, subkey = random.split(key)
+    key, subkey = random.split(key)
+    model = UnderdampedLangevinProcess(force_fn, D_matrix)
+    model.initialize(init_pos, init_vel, params_F=theta_F)
+    model.simulate(DT, N_STEPS, subkey,
+                   oversampling=OVERSAMPLING, prerun=PRERUN)
 
-        # Random initial position inside the domain (avoid walls)
-        margin = 0.05
-        x0 = np.random.uniform(x_min + margin * (x_max - x_min),
-                                x_max - margin * (x_max - x_min))
-        y0 = np.random.uniform(y_min + margin * (y_max - y_min),
-                                y_max - margin * (y_max - y_min))
-        init_pos = jnp.array([x0, y0])
-        init_vel = jnp.zeros(2)
+    fname = os.path.join(output_dir, f"traj_{sim_idx:04d}.csv")
+    model.save_trajectory_data(fname)
+    print(f"    {n_actual} cells ({nx}×{ny} grid) → {fname}")
 
-        model = UnderdampedLangevinProcess(force_fn, D_matrix)
-        model.initialize(init_pos, init_vel, params_F=theta_F)
-        model.simulate(DT, N_STEPS, subkey,
-                       oversampling=OVERSAMPLING, prerun=PRERUN)
-
-        fname = os.path.join(output_dir, f"traj_{sim_idx:04d}_cell{cell_idx:02d}.csv")
-        model.save_trajectory_data(fname)
-        output_paths.append(fname)
-        print(f"    Cell {cell_idx:02d} → {fname}")
-
-    return output_paths, key
+    return fname, n_actual, key
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -256,19 +280,20 @@ def main():
         Path(geo_out).mkdir(exist_ok=True)
 
         print(f"\nSim {sim_idx:04d}  [{geometry}]  {sim_meta['n_transducers']} transducer(s)")
-        traj_paths, key = simulate_for_field(h5_path, sim_idx, geo_out, key)
+        traj_path, n_cells, key = simulate_for_field(h5_path, sim_idx, geo_out, key)
 
         traj_metadata.append({
             'sim_index': sim_idx,
             'geometry': geometry,
             'n_transducers': sim_meta['n_transducers'],
-            'n_cells': N_CELLS,
+            'n_cells': n_cells,
             'dt': DT,
             'n_steps': N_STEPS,
             'oversampling': OVERSAMPLING,
             'gamma': GAMMA,
             'diffusion': DIFFUSION,
-            'trajectory_files': traj_paths,
+            'force_boost': FORCE_BOOST,
+            'trajectory_file': traj_path,
             'acoustic_field_file': h5_path,
         })
 
@@ -283,10 +308,10 @@ def main():
 if __name__ == '__main__':
     print("Underdamped Cell Trajectory Simulator")
     print("=" * 50)
-    print(f"Cells per field:  {N_CELLS}")
-    print(f"Steps per traj:   {N_STEPS}  ×  dt={DT:.3f} s  = {N_STEPS*DT:.1f} s total")
-    print(f"Damping γ:        {GAMMA} s⁻¹")
-    print(f"Diffusion D:      {DIFFUSION:.1e} m²/s")
-    print(f"Oversampling:     {OVERSAMPLING}×")
+    print(f"Target cells per field: {N_CELLS}  (regular grid)")
+    print(f"Steps per traj:         {N_STEPS}  ×  dt={DT:.3f} s  = {N_STEPS*DT:.1f} s total")
+    print(f"Damping γ:              {GAMMA} s⁻¹")
+    print(f"Diffusion D:            {DIFFUSION:.1e} m²/s³")
+    print(f"Oversampling:           {OVERSAMPLING}×")
     print()
     main()
