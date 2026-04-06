@@ -181,7 +181,8 @@ def place_transducers(kgrid, Nx: int, Ny: int, configs: list[TransducerConfig]):
 
     # Generate a reference burst to determine n_t, then build per-source signals.
     # tone_burst returns a properly windowed burst (short rise/fall, flat centre).
-    ref_burst = tone_burst(1.0 / dt, FREQUENCY, num_cycles)
+    # squeeze() handles the case where tone_burst returns shape (1, n_t).
+    ref_burst = np.squeeze(tone_burst(1.0 / dt, FREQUENCY, num_cycles))
     n_t = len(ref_burst)
     source_signals = np.zeros((num_sources, n_t))
 
@@ -190,7 +191,7 @@ def place_transducers(kgrid, Nx: int, Ny: int, configs: list[TransducerConfig]):
     for src_pos, (x_idx, phase_deg, amplitude) in enumerate(source_x_indices):
         # tone_burst has no phase argument; apply phase shift via time-domain roll.
         # A phase of φ rad corresponds to a delay of φ/(2π) cycles = φ/(2π*f) seconds.
-        burst = tone_burst(1.0 / dt, FREQUENCY, num_cycles)
+        burst = np.squeeze(tone_burst(1.0 / dt, FREQUENCY, num_cycles))
         delay_samples = int(round(np.deg2rad(phase_deg) / (2 * np.pi * FREQUENCY * dt)))
         burst = np.roll(burst, delay_samples)
         source_signals[src_pos, :] = amplitude * burst
