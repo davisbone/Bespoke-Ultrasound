@@ -1,5 +1,5 @@
 # cd /Users/davisbone/Repositories/Bespoke-Ultrasound
-# .venv/bin/python simulateTrajectories.py
+# .venv/bin/python 03simulateTrajectories.py
 
 """
 Synthetic Cell Trajectory Simulator
