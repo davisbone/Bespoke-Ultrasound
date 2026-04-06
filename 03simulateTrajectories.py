@@ -28,9 +28,17 @@ Output (per simulation):
     trajectoryData/traj_metadata.json
 
 Usage:
-    python simulateTrajectories.py
+    # Simulate all acoustic fields
+    python 03simulateTrajectories.py
+
+    # Simulate at most N fields (useful for development/testing)
+    python 03simulateTrajectories.py --max 5
+
+    # Simulate one geometry only
+    python 03simulateTrajectories.py --geometry well
 """
 
+import argparse
 import os
 import sys
 import json
@@ -52,8 +60,11 @@ from SFI.SFI_Langevin import UnderdampedLangevinProcess
 # SIMULATION PARAMETERS
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Medium sound speed — must match kwaveTrainingDataGenerator.py
+MEDIUM_SOUND_SPEED = 1540.0   # m/s
+
 # ── Acoustic force scaling ───────────────────────────────────────────────────
-# The k-Wave source was driven at 1 Pa (amplitude=1.0 in source.p).
+# The k-Wave source was driven at amplitude=1.0 via tone_burst (≈ 1 Pa peak).
 # Acoustic radiation force ∝ I ∝ p_rms².
 # Scale to the experimentally relevant LIPUS pressure (Harrison et al. 2025: ~160 kPa).
 TARGET_PRESSURE_PA  = 160e3        # Pa — target acoustic pressure at the cell layer
@@ -61,11 +72,13 @@ KWAVE_SOURCE_PA     = 1.0          # Pa — source amplitude used in simulation
 PRESSURE_SCALE      = (TARGET_PRESSURE_PA / KWAVE_SOURCE_PA) ** 2   # ≈ 2.56e10
 
 # Synthetic force boost for ULI demonstration.
-# The k-Wave point-source simulation at 1 Pa produces radiation force ~4e-7 m/s² after
-# scaling to 160 kPa. This is far too small for visible cell motion in a 22 mm domain.
-# FORCE_BOOST amplifies the spatial pattern to a regime where ULI inference is tractable.
-# The boost does NOT change the force topology (beam pattern), only its magnitude.
-FORCE_BOOST = 1e4     # dimensionless; effective force ~4e-3 m/s² after boost
+# radiation_force_dens is near-zero for the nearly lossless medium (see kwaveTrainingDataGenerator).
+# We instead derive ARF from intensity using the lossless-limit formula F = 2I/c [N/m³],
+# which preserves the correct spatial beam pattern.
+# FORCE_BOOST amplifies the pattern to a regime where ULI inference is tractable;
+# it does NOT change the force topology (beam pattern), only its magnitude.
+# Calibrated so that v_terminal = F_max/γ ≈ 8e-5 m/s → ~4 mm drift over 50 s (18% of well).
+FORCE_BOOST = 200     # dimensionless; effective force ~4e-3 m/s² after boost
 
 # ── Cell biophysics ──────────────────────────────────────────────────────────
 # Synthetic damping tuned so that:
@@ -110,7 +123,11 @@ PML_SIZE           = 20     # must match kwaveTrainingDataGenerator.py
 
 def load_force_field(h5_path: str):
     """
-    Load the radiation force density field from HDF5.
+    Load the acoustic intensity field from HDF5 and derive a radiation force proxy.
+
+    ARF is estimated using the lossless-limit formula F = 2·I/c [N/m³], which
+    gives a physically meaningful spatial pattern even when the medium absorption
+    is near-zero (where the stored radiation_force_dens field would be ~0).
 
     Scales to TARGET_PRESSURE_PA and converts N/m³ → m/s² (acceleration).
     Returns raw grid arrays for JAX-native bilinear interpolation.
@@ -122,16 +139,19 @@ def load_force_field(h5_path: str):
     y_m     : np.ndarray  depth coordinates      [m]
     """
     with h5py.File(h5_path, 'r') as f:
-        rf = f['radiation_force_dens'][:]
-        Nx  = int(f.attrs['Nx'])
-        Ny  = int(f.attrs['Ny'])
-        dx  = float(f.attrs['dx_m'])
+        intensity = np.array(f['intensity'])
+        Nx = int(np.asarray(f.attrs['Nx']).item())
+        Ny = int(np.asarray(f.attrs['Ny']).item())
+        dx = float(np.asarray(f.attrs['dx_m']).item())
 
-    rf_interior = rf[PML_SIZE:Nx - PML_SIZE, PML_SIZE:Ny - PML_SIZE]
-    iNx, iNy = rf_interior.shape
+    intensity_interior = intensity[PML_SIZE:Nx - PML_SIZE, PML_SIZE:Ny - PML_SIZE]
+    iNx, iNy = intensity_interior.shape
     x_m = np.arange(iNx, dtype=np.float64) * dx
     y_m = np.arange(iNy, dtype=np.float64) * dx
-    Fy_grid = (rf_interior * PRESSURE_SCALE * FORCE_SCALE * FORCE_BOOST).astype(np.float64)
+
+    # F [N/m³] = 2·I/c  (lossless limit radiation force density)
+    rf_proxy = intensity_interior * (2.0 / MEDIUM_SOUND_SPEED)
+    Fy_grid = (rf_proxy * PRESSURE_SCALE * FORCE_SCALE * FORCE_BOOST).astype(np.float64)
     return Fy_grid, x_m, y_m
 
 
@@ -262,9 +282,22 @@ def simulate_for_field(h5_path: str, sim_idx: int, output_dir: str, key):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description='Simulate underdamped cell trajectories')
+    parser.add_argument('--max', type=int, metavar='N',
+                        help='Simulate at most N acoustic fields (per geometry if --geometry set)')
+    parser.add_argument('--geometry', choices=['well', 'slide'],
+                        help='Restrict to one geometry only')
+    args = parser.parse_args()
+
     meta_path = os.path.join(TRAINING_DATA_ROOT, 'metadata.json')
     with open(meta_path) as f:
         all_sim_meta = json.load(f)
+
+    # Apply geometry filter then max-count limit
+    if args.geometry:
+        all_sim_meta = [m for m in all_sim_meta if m['geometry'] == args.geometry]
+    if args.max:
+        all_sim_meta = all_sim_meta[:args.max]
 
     Path(OUTPUT_ROOT).mkdir(exist_ok=True)
 
