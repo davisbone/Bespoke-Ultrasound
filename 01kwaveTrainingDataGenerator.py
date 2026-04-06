@@ -1,5 +1,5 @@
 # cd /Users/davisbone/Repositories/Bespoke-Ultrasound
-# .venv/bin/python kwaveTrainingDataGenerator.py
+# .venv/bin/python 01kwaveTrainingDataGenerator.py
 
 """
 Acoustic Pressure Field Training Data Generator
@@ -17,7 +17,7 @@ Requirements:
     pip install k-wave-python numpy h5py matplotlib tqdm
 
 Usage:
-    python kwaveTrainingDataGenerator.py
+    python 01kwaveTrainingDataGenerator.py
 
 Output:
     trainingData/
@@ -96,7 +96,7 @@ class TransducerConfig:
 class SimulationParams:
     """All parameters for one simulation run."""
     geometry: Literal["well", "slide"]
-    transducers: list
+    transducers: list[TransducerConfig]
     frequency_hz: float
     ppw: int
     cfl: float
