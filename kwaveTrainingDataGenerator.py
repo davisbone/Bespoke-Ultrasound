@@ -44,7 +44,6 @@ from kwave.kspaceFirstOrder2D import kspaceFirstOrder2D
 from kwave.options.simulation_options import SimulationOptions
 from kwave.options.simulation_execution_options import SimulationExecutionOptions
 from kwave.utils.signals import tone_burst
-from kwave.utils.mapgen import make_disc
 
 # ──────────────────────────────────────────────────────────────────
 # PHYSICAL CONSTANTS & GEOMETRY DEFINITIONS
@@ -173,35 +172,28 @@ def place_transducers(kgrid, Nx: int, Ny: int, configs: list[TransducerConfig]):
 
     source.p_mask = source_mask.astype(int)
 
-    # Build tone burst signals for each source point
-    t_end = 30.0 / FREQUENCY        # 30 cycles — enough for steady-state RMS
+    # Build tone burst signals for each source point.
+    # dt is derived from CFL; tone_burst needs sample_freq = 1/dt.
     dt = CFL * DX / MEDIUM_SOUND_SPEED
-    t_array = np.arange(0, t_end, dt)
-    n_t = len(t_array)
+    num_cycles = 30  # enough cycles for steady-state RMS
 
     num_sources = int(source_mask.sum())
+
+    # Generate a reference burst to determine n_t, then build per-source signals.
+    # tone_burst returns a properly windowed burst (short rise/fall, flat centre).
+    ref_burst = tone_burst(1.0 / dt, FREQUENCY, num_cycles)
+    n_t = len(ref_burst)
     source_signals = np.zeros((num_sources, n_t))
 
-    # Map source points in mask order (k-Wave reads mask column-major)
-    mask_flat = source_mask.flatten(order='F')
-    active_flat_indices = np.where(mask_flat)[0]
-
-    for flat_idx_pos, (x_idx, phase_deg, amplitude) in enumerate(source_x_indices):
-        # Flat index in column-major order
-        flat_idx = y_src * Nx + x_idx  # row-major approximation; adjust if needed
-        # Find position in active sources list
-        try:
-            src_pos = list(active_flat_indices).index(
-                np.ravel_multi_index([x_idx, y_src], (Nx, Ny), order='F')
-            )
-        except ValueError:
-            src_pos = flat_idx_pos
-
-        phase_rad = np.deg2rad(phase_deg)
-        signal = amplitude * np.sin(2 * np.pi * FREQUENCY * t_array + phase_rad)
-        # Apply Hanning taper to reduce spectral leakage
-        taper = np.hanning(n_t)
-        source_signals[src_pos % num_sources, :] = signal * taper
+    # k-Wave iterates the source mask in column-major (Fortran) order, which
+    # matches the order configs were appended — use enumerate directly.
+    for src_pos, (x_idx, phase_deg, amplitude) in enumerate(source_x_indices):
+        # tone_burst has no phase argument; apply phase shift via time-domain roll.
+        # A phase of φ rad corresponds to a delay of φ/(2π) cycles = φ/(2π*f) seconds.
+        burst = tone_burst(1.0 / dt, FREQUENCY, num_cycles)
+        delay_samples = int(round(np.deg2rad(phase_deg) / (2 * np.pi * FREQUENCY * dt)))
+        burst = np.roll(burst, delay_samples)
+        source_signals[src_pos, :] = amplitude * burst
 
     source.p = source_signals
     return source, dt, n_t
@@ -219,56 +211,82 @@ def make_sensor(Nx: int, Ny: int):
     return sensor
 
 
-def build_gravity_like_configs(geometry: str, n_transducers_list: list[int]):
+def build_gravity_like_configs(geometry: str, n_transducers_list: list[int],
+                               n_random: int = 50, rng_seed: int = 42):
     """
     Generate transducer configurations designed to create a net downward
     acoustic radiation force — analogous to a gravity-like field.
 
-    Strategy: evenly spaced transducers across the top wall, all in-phase.
-    Variations include:
-      - Number of transducers (1, 2, 4, 8, ...)
-      - Phase gradients to steer the beam angle (small angles → near-vertical)
-      - Amplitude tapering (uniform vs. Gaussian apodization)
+    Two pools are produced and combined:
+
+    1. Structured configs (evenly-spaced layouts):
+       Per transducer count n:
+         - Uniform in-phase (pure downward)
+         - Gaussian amplitude taper (reduce edge effects)
+         - Linear phase gradients at 5°, 10°, 15° beam steering
+
+    2. Random configs (diverse positions & amplitudes for ML coverage):
+       n_random configs with randomly drawn transducer counts, positions,
+       and per-element amplitudes. Positions are always drawn without
+       replacement at 5% minimum spacing to avoid degenerate configs.
 
     Returns a list of lists of TransducerConfig.
     """
     all_configs = []
+    rng = np.random.default_rng(rng_seed)
+    wavelength = MEDIUM_SOUND_SPEED / FREQUENCY
+    width_m = WELL_DIAMETER_M if geometry == "well" else SLIDE_WIDTH_M
 
+    # ── Structured configs ──────────────────────────────────────────
     for n in n_transducers_list:
         if n == 1:
-            # Single centered transducer
-            cfgs = [TransducerConfig(x_norm=0.5, phase_deg=0.0)]
-            all_configs.append(cfgs)
-        else:
-            # Evenly spaced, in-phase (pure downward)
-            positions = np.linspace(0.1, 0.9, n)
+            all_configs.append([TransducerConfig(x_norm=0.5, phase_deg=0.0)])
+            continue
 
-            # Config 1: All in-phase (uniform downward)
-            cfgs_uniform = [TransducerConfig(x_norm=p, phase_deg=0.0) for p in positions]
-            all_configs.append(cfgs_uniform)
+        positions = np.linspace(0.1, 0.9, n)
+        d = (0.9 - 0.1) / (n - 1) * width_m  # element spacing in metres
 
-            # Config 2: Gaussian amplitude taper (reduce edge effects)
-            center = 0.5
-            sigma = 0.25
-            weights = np.exp(-0.5 * ((positions - center) / sigma) ** 2)
-            cfgs_gauss = [
-                TransducerConfig(x_norm=p, phase_deg=0.0, amplitude=float(w))
-                for p, w in zip(positions, weights)
-            ]
-            all_configs.append(cfgs_gauss)
+        # Config: uniform in-phase
+        all_configs.append([TransducerConfig(x_norm=p, phase_deg=0.0) for p in positions])
 
-            # Config 3: Small linear phase gradient (slight beam steering ~5°)
-            # Phase shift per element: Δφ = 2π * d * sin(θ) / λ
-            d = (0.9 - 0.1) / (n - 1) * (WELL_DIAMETER_M if geometry == "well" else SLIDE_WIDTH_M)
-            wavelength = MEDIUM_SOUND_SPEED / FREQUENCY
-            theta_deg = 5.0
+        # Config: Gaussian amplitude taper
+        weights = np.exp(-0.5 * ((positions - 0.5) / 0.25) ** 2)
+        all_configs.append([
+            TransducerConfig(x_norm=p, phase_deg=0.0, amplitude=float(w))
+            for p, w in zip(positions, weights)
+        ])
+
+        # Configs: linear phase gradient at 5°, 10°, 15° beam steering
+        for theta_deg in [5.0, 10.0, 15.0]:
             delta_phi = 360.0 * d * np.sin(np.deg2rad(theta_deg)) / wavelength
             phases = np.arange(n) * delta_phi
-            cfgs_steered = [
+            all_configs.append([
                 TransducerConfig(x_norm=p, phase_deg=float(ph))
                 for p, ph in zip(positions, phases)
-            ]
-            all_configs.append(cfgs_steered)
+            ])
+
+    # ── Random configs ──────────────────────────────────────────────
+    for _ in range(n_random):
+        n = int(rng.choice(n_transducers_list))
+        # Draw n positions in [0.05, 0.95] with minimum 5% spacing
+        candidates = np.linspace(0.05, 0.95, 200)
+        rng.shuffle(candidates)
+        chosen = []
+        for c in candidates:
+            if all(abs(c - p) >= 0.05 for p in chosen):
+                chosen.append(c)
+            if len(chosen) == n:
+                break
+        if len(chosen) < n:
+            chosen = list(np.linspace(0.1, 0.9, n))  # fallback to evenly spaced
+        positions = np.sort(chosen)
+
+        # Random per-element amplitudes in [0.3, 1.0]
+        amplitudes = rng.uniform(0.3, 1.0, size=n)
+        all_configs.append([
+            TransducerConfig(x_norm=float(p), phase_deg=0.0, amplitude=float(a))
+            for p, a in zip(positions, amplitudes)
+        ])
 
     return all_configs
 
@@ -314,8 +332,13 @@ def run_simulation(geometry: str, configs: list[TransducerConfig], sim_idx: int,
     # Acoustic intensity I = p_rms² / (ρ c)  [W/m²]
     intensity = p_rms ** 2 / (MEDIUM_DENSITY * MEDIUM_SOUND_SPEED)
 
-    # Acoustic radiation force density (simplified): F = 2α*I/c  [N/m³]
-    # For lossless media, use gradient of acoustic energy density instead
+    # Acoustic radiation force density: F = 2α*I/c  [N/m³]
+    # NOTE: MEDIUM_ALPHA_COEFF is ~0.002 dB/(MHz·cm) — nearly lossless — so this
+    # formula produces near-zero values. For a lossless medium the dominant ARF
+    # source is reflection at boundaries, not bulk absorption; the field stored
+    # here is physically unreliable and should NOT be used directly as a ULI
+    # training target. Use p_rms / intensity instead and derive ARF from boundary
+    # conditions or a full radiation-stress-tensor calculation.
     alpha_np_m = MEDIUM_ALPHA_COEFF * 100 / (8.686 * FREQUENCY / 1e6)  # Np/m
     radiation_force_density = 2 * alpha_np_m * intensity / MEDIUM_SOUND_SPEED
 
@@ -355,6 +378,7 @@ def run_simulation(geometry: str, configs: list[TransducerConfig], sim_idx: int,
 def generate_training_dataset(
     geometries: list[str] = ['well', 'slide'],
     n_transducers_list: list[int] = [1, 2, 4, 8],
+    n_random: int = 50,
     output_root: str = 'trainingData',
 ):
     """
@@ -369,7 +393,8 @@ def generate_training_dataset(
         geo_dir = os.path.join(output_root, geometry)
         Path(geo_dir).mkdir(exist_ok=True)
 
-        configs_list = build_gravity_like_configs(geometry, n_transducers_list)
+        configs_list = build_gravity_like_configs(geometry, n_transducers_list,
+                                                  n_random=n_random)
         print(f"\n{'='*60}")
         print(f"Geometry: {geometry.upper()}")
         print(f"Total configurations: {len(configs_list)}")
@@ -404,5 +429,6 @@ if __name__ == '__main__':
     metadata = generate_training_dataset(
         geometries=['well', 'slide'],
         n_transducers_list=[1, 2, 4, 8],
+        n_random=50,          # random configs per geometry (50 → ~120 total sims each)
         output_root='trainingData',
     )
